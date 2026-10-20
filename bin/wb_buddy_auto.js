@@ -618,18 +618,16 @@ async function travelClaimArrived(headers, base, log) {
   const result = { state_after: state, daily_limit: dailyLimit, status_body: sbody, ok: true };
 
   if (state === 'arrived') {
-    const recordId = dig(sbody, 'record_id');
-    const [ccode, cbody] = await post(base + '/buddy/travel/claim', headers, { record_id: recordId }, false);
-    logStep(log, '旅行-领到家礼物', 'POST', '/v2/activity/growth/buddy/travel/claim', ccode, cbody);
-    const reward = dig(cbody, 'reward_credit');
-    if (ccode >= 200 && ccode < 300 && reward !== null && reward !== undefined) {
-      const got = asInt(reward);
-      Object.assign(result, { state_after: 'idle', claimed_credit: got, note: '领到旅行礼物 +' + fmtCredit(got) + ' 积分' });
-    } else {
-      const msg = isObject(cbody) ? (cbody.msg || '') : '';
-      // 领失败不置 idle，避免覆盖未领取的奖励、也不会去派新趟
-      Object.assign(result, { ok: false, note: '领旅行礼物失败：' + (msg || httpLabel(ccode)) });
-    }
+    // 礼物未领取：不自动代领，把领取入口交给用户手动领（领完再跑一次即可自动派新趟）
+    const deeplink = dig(sbody, 'use_deeplink');
+    const addr = (typeof deeplink === 'string' && deeplink.trim())
+      ? deeplink.trim()
+      : 'workbuddy://home?openBuddySwitcher=true（WorkBuddy → Buddy 加油站）';
+    Object.assign(result, {
+      manual_claim: true,
+      claim_address: addr,
+      note: '猫猫已回家，礼物未领取，请先手动领取。领取入口：' + addr + '；领取后再运行一次即可派新趟',
+    });
   } else if (state === 'traveling') {
     const loc = dig(sbody, 'location') || {};
     result.note = 'Buddy 旅行中（' + (loc.name != null ? loc.name : '?') + '）';
@@ -641,9 +639,30 @@ async function travelClaimArrived(headers, base, log) {
   return result;
 }
 
+// 随机挑一只已有猫猫设为当前（派新趟前换猫；任何失败都不影响派发）
+async function randomBuddySwitch(headers, base, log) {
+  try {
+    const [lcode, lbody] = await get(base + '/buddy/list', headers);
+    logStep(log, '猫猫-查列表', 'GET', '/v2/activity/growth/buddy/list', lcode, lbody);
+    if (!(lcode >= 200 && lcode < 300)) return { name: null };
+    const buddies = dig(lbody, 'buddies');
+    if (!Array.isArray(buddies) || !buddies.length) return { name: null };
+    const pool = buddies.filter(isObject);
+    const pick = pool[Math.floor(Math.random() * pool.length)];
+    if (!pick || pick.instance_id == null) return { name: null };
+    const [rcode, rbody] = await post(base + '/buddy/switch', headers, { instance_id: pick.instance_id }, false);
+    logStep(log, '猫猫-随机切换', 'POST', '/v2/activity/growth/buddy/switch', rcode, rbody);
+    if (!(rcode >= 200 && rcode < 300)) return { name: null };
+    return { name: pick.name != null ? pick.name : 'Buddy', instance_id: pick.instance_id };
+  } catch (_) {
+    return { name: null };
+  }
+}
+
 async function travelTryDispatch(headers, base, claim, log) {
   const state = claim.state_after;
   if (state === 'traveling') return { ok: true, note: '今日已派过，Buddy 在路上，跳过派发' };
+  if (state === 'arrived') return { ok: true, note: '猫猫礼物未领取，请先手动领取（见领取入口），领取后再运行一次即可派新趟' };
   if (state !== 'idle') return { ok: true, note: '当前不可派（state=' + state + '）' };
   if (claim.daily_limit) return { ok: true, note: '今日旅行名额已用完，不派' };
 
@@ -656,13 +675,17 @@ async function travelTryDispatch(headers, base, claim, log) {
   }
   const loc = locs[0];
 
+  // 派新趟前随机换一只已有猫猫（切换失败不影响本次派发）
+  const rc = await randomBuddySwitch(headers, base, log);
+
   const [dcode, dbody] = await post(base + '/buddy/travel/depart', headers, { location_id: loc.id }, false);
   logStep(log, '旅行-派新一趟', 'POST', '/v2/activity/growth/buddy/travel/depart', dcode, dbody);
   if (dcode >= 200 && dcode < 300) {
     const dloc = dig(dbody, 'location') || {};
     const locName = dloc.name != null ? dloc.name : '?';
     const dur = dig(dbody, 'duration_hours') || (dloc.duration_hours != null ? dloc.duration_hours : '?');
-    return { ok: true, dispatched: true, note: '派 Buddy 去' + locName + '（' + dur + ' 小时后回）' };
+    const who = rc.name ? rc.name + '（随机选中）' : 'Buddy';
+    return { ok: true, dispatched: true, buddy: rc.name, note: '派 ' + who + ' 去' + locName + '（' + dur + ' 小时后回）' };
   }
   const msg = dig(dbody, 'msg') || '';
   return { ok: false, note: '派 Buddy 失败：' + (msg || httpLabel(dcode)) };
@@ -735,7 +758,8 @@ async function run() {
         claim: claim.note,
         dispatch: disp.note,
         claimed_credit: claim.claimed_credit,
-        result: (claim.ok && disp.ok) ? 'OK' : 'PARTIAL',
+        claim_address: claim.claim_address,
+        result: claim.manual_claim ? 'NEED_CLAIM' : ((claim.ok && disp.ok) ? 'OK' : 'PARTIAL'),
       };
     } catch (e) {
       travel = { result: 'ERROR', report: '旅行模块异常（' + e.name + ': ' + e.message + '）' };
@@ -760,7 +784,7 @@ async function run() {
     report,
     checkin: checkout,
     travel,
-    needs_attention: (!success) || (travel.result === 'ERROR'),
+    needs_attention: (!success) || (travel.result === 'ERROR') || (travel.result === 'NEED_CLAIM'),
     raw: log,
   };
 }
