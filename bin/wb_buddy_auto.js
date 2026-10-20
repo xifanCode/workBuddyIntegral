@@ -618,16 +618,30 @@ async function travelClaimArrived(headers, base, log) {
   const result = { state_after: state, daily_limit: dailyLimit, status_body: sbody, ok: true };
 
   if (state === 'arrived') {
-    // 礼物未领取：不自动代领，把领取入口交给用户手动领（领完再跑一次即可自动派新趟）
-    const deeplink = dig(sbody, 'use_deeplink');
-    const addr = (typeof deeplink === 'string' && deeplink.trim())
-      ? deeplink.trim()
-      : 'workbuddy://home?openBuddySwitcher=true（WorkBuddy → Buddy 加油站）';
-    Object.assign(result, {
-      manual_claim: true,
-      claim_address: addr,
-      note: '猫猫已回家，礼物未领取，请先手动领取。领取入口：' + addr + '；领取后再运行一次即可派新趟',
-    });
+    // 每次运行先「领取已到家的旅行奖励」，领取成功置 idle 后即可随机换猫派新趟。
+    // 仅当自动领取失败时，才降级为「给领取入口让用户手动领」。
+    const recordId = dig(sbody, 'record_id');
+    const [ccode, cbody] = await post(base + '/buddy/travel/claim', headers, { record_id: recordId }, false);
+    logStep(log, '旅行-领到家礼物', 'POST', '/v2/activity/growth/buddy/travel/claim', ccode, cbody);
+    const reward = dig(cbody, 'reward_credit');
+    if (ccode >= 200 && ccode < 300 && reward !== null && reward !== undefined) {
+      const got = asInt(reward);
+      Object.assign(result, { state_after: 'idle', claimed_credit: got, note: '领到旅行礼物 +' + fmtCredit(got) + ' 积分' });
+    } else {
+      const msg = isObject(cbody) ? (cbody.msg || '') : '';
+      // 领失败不置 idle，避免覆盖未领取的奖励、也不会去派新趟；降级为手动领取引导
+      const deeplink = dig(sbody, 'use_deeplink');
+      const addr = (typeof deeplink === 'string' && deeplink.trim())
+        ? deeplink.trim()
+        : 'workbuddy://home?openBuddySwitcher=true（WorkBuddy → Buddy 加油站）';
+      Object.assign(result, {
+        ok: false,
+        manual_claim: true,
+        claim_address: addr,
+        note: '自动领取失败（' + (msg || httpLabel(ccode)) + '）。请先手动领取，领取入口：' + addr
+          + '；领取后再运行一次即可随机换猫派新趟',
+      });
+    }
   } else if (state === 'traveling') {
     const loc = dig(sbody, 'location') || {};
     result.note = 'Buddy 旅行中（' + (loc.name != null ? loc.name : '?') + '）';
