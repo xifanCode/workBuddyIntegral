@@ -626,7 +626,7 @@ async function travelClaimArrived(headers, base, log) {
     const reward = dig(cbody, 'reward_credit');
     if (ccode >= 200 && ccode < 300 && reward !== null && reward !== undefined) {
       const got = asInt(reward);
-      Object.assign(result, { state_after: 'idle', claimed_credit: got, note: '领到旅行礼物 +' + fmtCredit(got) + ' 积分' });
+      Object.assign(result, { state_after: 'idle', claimed_credit: got, note: '领到旅行礼物 +' + fmtCredit(got) + ' 积分；无需等到第二天，现在就可随机换猫派新趟' });
     } else {
       const msg = isObject(cbody) ? (cbody.msg || '') : '';
       // 领失败不置 idle，避免覆盖未领取的奖励、也不会去派新趟；降级为手动领取引导
@@ -638,13 +638,14 @@ async function travelClaimArrived(headers, base, log) {
         ok: false,
         manual_claim: true,
         claim_address: addr,
-        note: '自动领取失败（' + (msg || httpLabel(ccode)) + '）。请先手动领取，领取入口：' + addr
-          + '；领取后再运行一次即可随机换猫派新趟',
+        note: '自动领取失败（' + (msg || httpLabel(ccode)) + '）。奖励可随时在客户端手动领取（不依赖脚本、不必等第二天），领取入口：' + addr
+          + '；领取后随时再运行一次即可随机换猫派新趟',
       });
     }
   } else if (state === 'traveling') {
     const loc = dig(sbody, 'location') || {};
-    result.note = 'Buddy 旅行中（' + (loc.name != null ? loc.name : '?') + '）';
+    result.note = 'Buddy 旅行中（' + (loc.name != null ? loc.name : '?') + '）；奖励到家后可随时领取'
+      + '（客户端手动领或让我自动领皆可），领完即可随机换猫派新趟';
   } else if (state === 'idle') {
     result.note = '旅行空闲，可派新趟';
   } else {
@@ -775,6 +776,13 @@ async function run() {
         claim_address: claim.claim_address,
         result: claim.manual_claim ? 'NEED_CLAIM' : ((claim.ok && disp.ok) ? 'OK' : 'PARTIAL'),
       };
+      if (claim.claimed_credit != null) travel.reward_credit = claim.claimed_credit;
+      // 猫猫奖励积分显式进日志(与签到积分并列汇总一条)
+      log.push({
+        step: '积分汇总',
+        checkin_credit: dig(checkout, 'today_credit'),
+        travel_reward_credit: claim.claimed_credit != null ? claim.claimed_credit : 0,
+      });
     } catch (e) {
       travel = { result: 'ERROR', report: '旅行模块异常（' + e.name + ': ' + e.message + '）' };
     }
