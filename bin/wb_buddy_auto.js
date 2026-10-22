@@ -629,18 +629,35 @@ async function travelClaimArrived(headers, base, log) {
       Object.assign(result, { state_after: 'idle', claimed_credit: got, note: '领到旅行礼物 +' + fmtCredit(got) + ' 积分；无需等到第二天，现在就可随机换猫派新趟' });
     } else {
       const msg = isObject(cbody) ? (cbody.msg || '') : '';
-      // 领失败不置 idle，避免覆盖未领取的奖励、也不会去派新趟；降级为手动领取引导
-      const deeplink = dig(sbody, 'use_deeplink');
-      const addr = (typeof deeplink === 'string' && deeplink.trim())
-        ? deeplink.trim()
-        : 'workbuddy://home?openBuddySwitcher=true（WorkBuddy → Buddy 加油站）';
-      Object.assign(result, {
-        ok: false,
-        manual_claim: true,
-        claim_address: addr,
-        note: '自动领取失败（' + (msg || httpLabel(ccode)) + '）。奖励可随时在客户端手动领取（不依赖脚本、不必等第二天），领取入口：' + addr
-          + '；领取后随时再运行一次即可随机换猫派新趟',
-      });
+      // 领取返回非预期（HTTP 非 2xx / 业务报错 / 缺 reward_credit）≠ 真失败：
+      // 最常见是「双领」——用户刚在客户端手动领过，服务端返回"已领取"类错误。
+      // 此时奖励其实已入账。重新查一次旅行状态做仲裁：
+      //   状态已离开 arrived → 奖励已入账，按幂等成功处理（可继续派新趟）；
+      //   仍是 arrived → 才是真失败，降级为手动领取引导。
+      const [vcode, vbody] = await get(base + '/buddy/travel/status', headers);
+      logStep(log, '旅行-领取仲裁', 'GET', '/v2/activity/growth/buddy/travel/status', vcode, vbody);
+      const vState = dig(vbody, 'state');
+      if (vcode >= 200 && vcode < 300 && vState === 'idle') {
+        Object.assign(result, {
+          state_after: 'idle',
+          note: '旅行奖励已领取（若你刚在客户端手动领过，以客户端为准）；现在就可随机换猫派新趟',
+        });
+      } else if (vcode >= 200 && vcode < 300 && vState === 'traveling') {
+        Object.assign(result, { state_after: 'traveling', note: 'Buddy 旅行中；奖励到家后可随时领取（客户端手动领或让我自动领皆可）' });
+      } else {
+        // 真失败：不置 idle，避免覆盖未领取的奖励、也不会去派新趟；降级为手动领取引导
+        const deeplink = dig(sbody, 'use_deeplink');
+        const addr = (typeof deeplink === 'string' && deeplink.trim())
+          ? deeplink.trim()
+          : 'workbuddy://home?openBuddySwitcher=true（WorkBuddy → Buddy 加油站）';
+        Object.assign(result, {
+          ok: false,
+          manual_claim: true,
+          claim_address: addr,
+          note: '自动领取失败（' + (msg || httpLabel(ccode)) + '）。奖励可随时在客户端手动领取（不依赖脚本、不必等第二天），领取入口：' + addr
+            + '；领取后随时再运行一次即可随机换猫派新趟',
+        });
+      }
     }
   } else if (state === 'traveling') {
     const loc = dig(sbody, 'location') || {};
@@ -661,7 +678,7 @@ async function randomBuddySwitch(headers, base, log) {
     logStep(log, '猫猫-查列表', 'GET', '/v2/activity/growth/buddy/list', lcode, lbody);
     if (!(lcode >= 200 && lcode < 300)) return { name: null };
     const buddies = dig(lbody, 'buddies');
-    if (!Array.isArray(buddies) || !buddies.length) return { name: null };
+    if (!Array.isArray(buddies) || !buddies.length) return { name: null, noBuddy: true };
     const pool = buddies.filter(isObject);
     const pick = pool[Math.floor(Math.random() * pool.length)];
     if (!pick || pick.instance_id == null) return { name: null };
@@ -692,6 +709,15 @@ async function travelTryDispatch(headers, base, claim, log) {
 
   // 派新趟前随机换一只已有猫猫（切换失败不影响本次派发）
   const rc = await randomBuddySwitch(headers, base, log);
+  // 没有任何猫猫时，直接给出领取引导，不假装派发（避免误导日志）
+  if (rc.noBuddy) {
+    return {
+      ok: true,
+      noBuddy: true,
+      note: '你当前还没有任何猫猫(Buddy)，无法派发旅行。请先到 WorkBuddy → Buddy 加油站 免费领养一只猫猫(活动常驻)，'
+        + '领养后再次运行本助手即可自动派它去旅行、并自动领取到家的积分。',
+    };
+  }
 
   const [dcode, dbody] = await post(base + '/buddy/travel/depart', headers, { location_id: loc.id }, false);
   logStep(log, '旅行-派新一趟', 'POST', '/v2/activity/growth/buddy/travel/depart', dcode, dbody);
@@ -774,6 +800,7 @@ async function run() {
         dispatch: disp.note,
         claimed_credit: claim.claimed_credit,
         claim_address: claim.claim_address,
+        noBuddy: Boolean(disp.noBuddy),
         result: claim.manual_claim ? 'NEED_CLAIM' : ((claim.ok && disp.ok) ? 'OK' : 'PARTIAL'),
       };
       if (claim.claimed_credit != null) travel.reward_credit = claim.claimed_credit;

@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-checkin-helper",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "Automate WorkBuddy Buddy Gas Station daily check-in and cat travel to collect points safely from the local desktop session.",
   "author": {
     "name": "xifan",
